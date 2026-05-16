@@ -187,7 +187,7 @@ function parseXlsx(file) {
 export default function App() {
   const [screen, setScreen] = useState("landing");
   const [currentUser, setCurrentUser] = useState(null); // { id, name }
-  const [isAdmin, setIsAdmin] = useState(false);
+  const [isAdmin, setIsAdmin] = useState(false); // eslint-disable-line no-unused-vars
   const [products, setProducts] = useState([]);
   const [dbReady, setDbReady] = useState(false);
   const [orders, setOrders] = useState([]);
