@@ -127,3 +127,4 @@ gemuese-app/
 | `user_name` | text | Name des Bestellers (eindeutig) |
 | `cart` | jsonb | `{ "produktId": menge, … }` |
 | `updated_at` | timestamptz | Letztes Speicherdatum |
+# gemuese-kisterl
