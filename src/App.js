@@ -129,6 +129,19 @@ async function dbReplaceProducts(products) {
   const { error } = await supabase.from("products").insert(products);
   if (error) throw error;
 }
+async function dbUpdateProduct(id, fields) {
+  const { error } = await supabase.from("products").update(fields).eq("id", id);
+  if (error) throw error;
+}
+async function dbDeleteProduct(id) {
+  const { error } = await supabase.from("products").delete().eq("id", id);
+  if (error) throw error;
+}
+async function dbAddProduct(product) {
+  const { data, error } = await supabase.from("products").insert(product).select().single();
+  if (error) throw error;
+  return data;
+}
 
 async function dbLoadUsers() {
   const { data, error } = await supabase.from("users").select("id, name, password").order("name");
@@ -166,14 +179,61 @@ function parseXlsx(file) {
     reader.onload = (e) => {
       try {
         const wb = XLSX.read(e.target.result, { type: "array" });
-        const sheet = wb.Sheets[wb.SheetNames[0]];
-        const rows = XLSX.utils.sheet_to_json(sheet, { header: 1 });
+
+        // Prefer sheet named "Gemüse", otherwise first sheet
+        const sheetName =
+          wb.SheetNames.find((n) =>
+            n.toLowerCase().includes("gem") || n.toLowerCase().includes("produkt")
+          ) || wb.SheetNames[0];
+        const sheet = wb.Sheets[sheetName];
+
+        const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: null });
         const products = [];
+        const seenNames = new Set();
+
         for (const row of rows) {
-          const name = row[1]; const price = row[2]; const unit = row[3];
-          if (name && typeof name === "string" && name.trim() && price && !isNaN(price))
-            products.push({ name: name.trim(), price: parseFloat(price), unit: unit ? String(unit).trim() : "", category: "Alle Produkte", special: false });
+          // Dynamically find the first column with a proper product name string
+          let nameIdx = -1;
+          let name = null;
+          for (let i = 0; i < Math.min(row.length, 4); i++) {
+            const cell = row[i];
+            if (cell && typeof cell === "string" && cell.trim().length > 2) {
+              nameIdx = i;
+              name = cell.trim();
+              break;
+            }
+          }
+          if (!name || nameIdx < 0) continue;
+
+          // Price is the next column, unit the one after
+          const rawPrice = row[nameIdx + 1];
+          const rawUnit  = row[nameIdx + 2];
+
+          // Parse price robustly (handle "3,60" or plain numbers)
+          let price = null;
+          if (typeof rawPrice === "number" && rawPrice > 0) {
+            price = rawPrice;
+          } else if (typeof rawPrice === "string") {
+            const cleaned = rawPrice.replace(",", ".").replace(/[^0-9.]/g, "");
+            const p = parseFloat(cleaned);
+            if (!isNaN(p) && p > 0) price = p;
+          }
+          if (!price) continue;
+
+          // Skip duplicate names (continuation rows from merged cells)
+          const key = name.toLowerCase();
+          if (seenNames.has(key)) continue;
+          seenNames.add(key);
+
+          products.push({
+            name,
+            price,
+            unit: rawUnit ? String(rawUnit).trim() : "",
+            category: "Alle Produkte",
+            special: false,
+          });
         }
+
         resolve(products);
       } catch (err) { reject(err); }
     };
@@ -323,6 +383,7 @@ export default function App() {
       onUploadClick={() => fileRef.current.click()}
       uploadMsg={uploadMsg} onLogout={handleLogout}
       onRefresh={async () => setOrders(await dbLoadAllOrders())}
+      onReloadProducts={async () => setProducts(await dbLoadProducts())}
       loading={loading}
     >
       <input ref={fileRef} type="file" accept=".xlsx,.xls" style={{ display: "none" }} onChange={handleFileUpload} />
@@ -711,8 +772,42 @@ function ProductCard({ product, qty, onQty, onSetQty }) {
 
 // ── Admin Panel ───────────────────────────────────────────────────────────────
 
-function AdminPanel({ orders, products, onUploadClick, uploadMsg, onLogout, onRefresh, loading, children }) {
+function AdminPanel({ orders, products, onUploadClick, uploadMsg, onLogout, onRefresh, onReloadProducts, loading, children }) {
   const [tab, setTab] = useState("orders");
+  const [editingId, setEditingId] = useState(null);
+  const [editFields, setEditFields] = useState({ name: "", price: "", unit: "" });
+  const [showNewForm, setShowNewForm] = useState(false);
+  const [newProduct, setNewProduct] = useState({ name: "", price: "", unit: "", category: "Gemüse" });
+  const [productSearch, setProductSearch] = useState("");
+
+  const handleSaveProduct = async (id) => {
+    const price = parseFloat(editFields.price);
+    if (!editFields.name.trim() || isNaN(price) || price <= 0) return;
+    try {
+      await dbUpdateProduct(id, { name: editFields.name.trim(), price, unit: editFields.unit.trim() });
+      await onReloadProducts();
+      setEditingId(null);
+    } catch (e) { console.error(e); }
+  };
+
+  const handleDeleteProduct = async (id) => {
+    if (!window.confirm("Produkt wirklich löschen?")) return; // eslint-disable-line no-restricted-globals
+    try {
+      await dbDeleteProduct(id);
+      await onReloadProducts();
+    } catch (e) { console.error(e); }
+  };
+
+  const handleAddProduct = async () => {
+    const price = parseFloat(newProduct.price);
+    if (!newProduct.name.trim() || isNaN(price) || price <= 0) return;
+    try {
+      await dbAddProduct({ name: newProduct.name.trim(), price, unit: newProduct.unit.trim(), category: newProduct.category, special: false });
+      await onReloadProducts();
+      setShowNewForm(false);
+      setNewProduct({ name: "", price: "", unit: "", category: "Gemüse" });
+    } catch (e) { console.error(e); }
+  };
 
   const totalOrders = orders.length;
   const totalProductsOrdered = new Set(orders.flatMap((o) => Object.keys(o.cart || {}).map(Number))).size;
@@ -801,14 +896,96 @@ function AdminPanel({ orders, products, onUploadClick, uploadMsg, onLogout, onRe
         )}
 
         {tab === "products" && (
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fill, minmax(240px, 1fr))", gap: 10 }}>
-            {products.map((p) => (
-              <div key={p.id} style={{ background: "white", borderRadius: 12, padding: "12px 16px", border: "1px solid #e8f5e9" }}>
-                <div style={{ fontSize: 13, fontWeight: 600, color: "#14532d", marginBottom: 4 }}>{p.name}</div>
-                <div style={{ fontSize: 12, color: "#4b7c59" }}>€ {p.price.toFixed(2)} / {p.unit}</div>
-                <div style={{ fontSize: 11, color: "#86efac", marginTop: 2 }}>{p.category}</div>
+          <div>
+            <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: "1rem", flexWrap: "wrap" }}>
+              <input type="text" placeholder="🔍 Produkt suchen…" value={productSearch}
+                onChange={(e) => setProductSearch(e.target.value)}
+                style={{ ...inputStyle, flex: "1 1 200px", padding: "8px 12px", fontSize: 13 }} />
+              <span style={{ color: "#4b7c59", fontSize: 13, whiteSpace: "nowrap" }}>
+                {products.filter((p) => p.name.toLowerCase().includes(productSearch.toLowerCase())).length} / {products.length}
+              </span>
+              <button onClick={() => { setShowNewForm(true); setEditingId(null); }} disabled={showNewForm}
+                style={{ background: "#16a34a", color: "white", border: "none", borderRadius: 10, padding: "8px 18px", fontSize: 13, fontWeight: 700, cursor: "pointer", opacity: showNewForm ? 0.5 : 1 }}>
+                + Neues Produkt
+              </button>
+            </div>
+
+            {showNewForm && (
+              <div style={{ background: "#f0fdf4", borderRadius: 12, padding: "16px", border: "2px solid #86efac", marginBottom: "1rem" }}>
+                <div style={{ fontWeight: 700, color: "#14532d", marginBottom: 12, fontSize: 14 }}>Neues Produkt hinzufügen</div>
+                <div style={{ display: "flex", flexWrap: "wrap", gap: 8, marginBottom: 8 }}>
+                  <input placeholder="Produktname *" value={newProduct.name}
+                    onChange={(e) => setNewProduct((p) => ({ ...p, name: e.target.value }))}
+                    style={{ ...inputStyle, flex: "1 1 200px", padding: "8px 12px", fontSize: 13 }} />
+                  <input type="number" placeholder="Preis (€) *" step="0.1" min="0" value={newProduct.price}
+                    onChange={(e) => setNewProduct((p) => ({ ...p, price: e.target.value }))}
+                    style={{ ...inputStyle, width: 110, flex: "0 0 110px", padding: "8px 12px", fontSize: 13 }} />
+                  <input placeholder="Einheit (z.B. Kilo)" value={newProduct.unit}
+                    onChange={(e) => setNewProduct((p) => ({ ...p, unit: e.target.value }))}
+                    style={{ ...inputStyle, width: 140, flex: "0 0 140px", padding: "8px 12px", fontSize: 13 }} />
+                </div>
+                <select value={newProduct.category}
+                  onChange={(e) => setNewProduct((p) => ({ ...p, category: e.target.value }))}
+                  style={{ ...inputStyle, marginBottom: 12, padding: "8px 12px", fontSize: 13 }}>
+                  {Object.keys(categoryIcons).filter((c) => c !== "Alle Produkte").map((cat) => (
+                    <option key={cat} value={cat}>{categoryIcons[cat]} {cat}</option>
+                  ))}
+                </select>
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button onClick={handleAddProduct}
+                    style={{ background: "#16a34a", color: "white", border: "none", borderRadius: 8, padding: "8px 18px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+                    Hinzufügen
+                  </button>
+                  <button onClick={() => { setShowNewForm(false); setNewProduct({ name: "", price: "", unit: "", category: "Gemüse" }); }}
+                    style={{ background: "white", color: "#4b7c59", border: "1px solid #bbf7d0", borderRadius: 8, padding: "8px 18px", fontSize: 13, cursor: "pointer" }}>
+                    Abbrechen
+                  </button>
+                </div>
               </div>
-            ))}
+            )}
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {products.filter((p) => p.name.toLowerCase().includes(productSearch.toLowerCase())).map((p) => editingId === p.id ? (
+                <div key={p.id} style={{ background: "white", borderRadius: 12, padding: "12px 16px", border: "2px solid #86efac", display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+                  <input value={editFields.name}
+                    onChange={(e) => setEditFields((f) => ({ ...f, name: e.target.value }))}
+                    style={{ ...inputStyle, flex: "1 1 180px", padding: "6px 10px", fontSize: 13 }} />
+                  <input type="number" step="0.1" min="0" value={editFields.price}
+                    onChange={(e) => setEditFields((f) => ({ ...f, price: e.target.value }))}
+                    style={{ ...inputStyle, width: 90, flex: "0 0 90px", padding: "6px 10px", fontSize: 13 }} />
+                  <input value={editFields.unit}
+                    onChange={(e) => setEditFields((f) => ({ ...f, unit: e.target.value }))}
+                    style={{ ...inputStyle, width: 120, flex: "0 0 120px", padding: "6px 10px", fontSize: 13 }} />
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <button onClick={() => handleSaveProduct(p.id)}
+                      style={{ background: "#16a34a", color: "white", border: "none", borderRadius: 8, padding: "6px 14px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
+                      Speichern
+                    </button>
+                    <button onClick={() => setEditingId(null)}
+                      style={{ background: "white", color: "#4b7c59", border: "1px solid #bbf7d0", borderRadius: 8, padding: "6px 14px", fontSize: 12, cursor: "pointer" }}>
+                      Abbrechen
+                    </button>
+                  </div>
+                </div>
+              ) : (
+                <div key={p.id} style={{ background: "white", borderRadius: 12, padding: "12px 16px", border: "1px solid #e8f5e9", display: "flex", alignItems: "center", gap: 10 }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: "#14532d" }}>{p.name}</div>
+                    <div style={{ fontSize: 12, color: "#4b7c59" }}>€ {p.price.toFixed(2)} / {p.unit} · <span style={{ color: "#6ee7b7" }}>{p.category}</span></div>
+                  </div>
+                  <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
+                    <button onClick={() => { setEditingId(p.id); setEditFields({ name: p.name, price: p.price, unit: p.unit }); setShowNewForm(false); }}
+                      style={{ background: "white", color: "#4b7c59", border: "1px solid #bbf7d0", borderRadius: 8, padding: "5px 12px", fontSize: 12, cursor: "pointer" }}>
+                      Bearbeiten
+                    </button>
+                    <button onClick={() => handleDeleteProduct(p.id)}
+                      style={{ background: "white", color: "#dc2626", border: "1px solid #fca5a5", borderRadius: 8, padding: "5px 12px", fontSize: 12, cursor: "pointer" }}>
+                      Löschen
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
           </div>
         )}
 
