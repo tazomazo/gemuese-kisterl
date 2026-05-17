@@ -116,9 +116,9 @@ const categoryIcons = {
 // ── Supabase helpers ──────────────────────────────────────────────────────────
 
 async function dbLoadProducts() {
-  const { data, error } = await supabase.from("products").select("*").order("id");
+  const { data, error } = await supabase.from("products").select("*, categories(name)").order("id");
   if (error) throw error;
-  return data;
+  return data.map((p) => ({ ...p, category: p.categories?.name ?? "" }));
 }
 async function dbSeedProducts(products) {
   const { error } = await supabase.from("products").insert(products);
@@ -164,6 +164,29 @@ async function dbSaveOrder(userId, cart) {
     .upsert({ user_id: userId, cart, updated_at: new Date().toISOString() }, { onConflict: "user_id" });
   if (error) throw error;
 }
+async function dbLoadCategories() {
+  const { data, error } = await supabase.from("categories").select("*").order("sort_order").order("name");
+  if (error) throw error;
+  return data;
+}
+async function dbSeedCategories(cats) {
+  const { error } = await supabase.from("categories").insert(cats);
+  if (error) throw error;
+}
+async function dbAddCategory(name) {
+  const { data, error } = await supabase.from("categories").insert({ name, sort_order: 999 }).select().single();
+  if (error) throw error;
+  return data;
+}
+async function dbRenameCategory(id, newName) {
+  const { error } = await supabase.from("categories").update({ name: newName }).eq("id", id);
+  if (error) throw error;
+}
+async function dbDeleteCategory(id) {
+  const { error } = await supabase.from("categories").delete().eq("id", id);
+  if (error) throw error;
+}
+
 async function dbLoadAllOrders() {
   const { data, error } = await supabase
     .from("orders")
@@ -173,7 +196,30 @@ async function dbLoadAllOrders() {
   return data || [];
 }
 
-function parseXlsx(file) {
+function guessProductCategory(name) {
+  const n = name.toLowerCase();
+  if (n.includes("spargel") || n.includes("rhabarber") || n.includes("bärlauch")) return "Frühlingsneuheiten";
+  if (n.includes("kartoffel") || n.includes("erdäpfel") || n.includes("süßkartoffel") || n.includes("heurige") || n.includes("linzer rose")) return "Kartoffeln & Wurzeln";
+  if (n.includes("apfel") || n.includes("birne") || n.includes("beere") || n.includes("traube") || n.includes("kiwi") ||
+      n.includes("avocado") || n.includes("banane") || n.includes("orange") || n.includes("mandarine") ||
+      n.includes("zitrone") || n.includes("grapefruit") || n.includes("marill") || n.includes("ribisel") ||
+      n.includes("maroni")) return "Obst & Früchte";
+  if (n.includes("champignon") || n.includes("seitling") || n.includes("austernpilz") || n.includes("pilz")) return "Pilze";
+  if (n.includes("zwiebel") || n.includes("knoblauch") || n.includes("schalott")) return "Zwiebeln & Knoblauch";
+  if (n.includes("basilikum") || n.includes("koriander") || n.includes("rosmarin") || n.includes("thymian") ||
+      n.includes("petersilie") || n.includes("schnittlauch") || n.includes("dille") || n.includes("ingwer") ||
+      n.includes("kresse")) return "Kräuter";
+  if (n.includes("nuss") || n.includes("nüsse") || n.includes("erdnuss") || n.includes("granola") || n.includes("kren")) return "Nüsse & Extras";
+  if (n.includes("essig") || n.includes("kernöl") || (n.includes("öl") && !n.includes("kohlrabi"))) return "Öle & Essige";
+  if (n.includes("nektar") || n.includes("saft") || n.includes("honig")) return "Säfte & Honig";
+  if (n.includes("eier") || n.includes("freilandei") || (n.includes(" ei") && n.includes("bio"))) return "Eier";
+  if (n.includes("salat") || n.includes("spinat") || n.includes("mangold") || n.includes("fisolen") ||
+      n.includes("kohlsprossen") || n.includes("pak choi") || n.includes("rucola") || n.includes("vogerlsalat") ||
+      n.includes("chicorée") || n.includes("jägersalat") || n.includes("chinakohl")) return "Blatt & Salat";
+  return "Gemüse";
+}
+
+function parseXlsx(file, existingProducts = [], categories = []) {
   return new Promise((resolve, reject) => {
     const reader = new FileReader();
     reader.onload = (e) => {
@@ -229,7 +275,10 @@ function parseXlsx(file) {
             name,
             price,
             unit: rawUnit ? String(rawUnit).trim() : "",
-            category: "Alle Produkte",
+            category_id: (() => {
+              const catName = existingProducts.find((ep) => ep.name.toLowerCase() === name.toLowerCase())?.category ?? guessProductCategory(name);
+              return categories.find((c) => c.name === catName)?.id ?? categories[0]?.id ?? null;
+            })(),
             special: false,
           });
         }
@@ -242,60 +291,46 @@ function parseXlsx(file) {
   });
 }
 
-async function fetchMailchimpHtml(url) {
-  // In production (Vercel): use own serverless function – no CORS issues, no IP blocks
-  const apiRes = await fetch(`/api/fetch-newsletter?url=${encodeURIComponent(url)}`);
-  if (apiRes.ok) return apiRes.text();
-  // Fallback for local dev (CRA dev server doesn't serve /api/)
-  const proxyRes = await fetch(`https://corsproxy.io/?${encodeURIComponent(url)}`);
-  if (!proxyRes.ok) throw new Error(`Status ${proxyRes.status}`);
-  return proxyRes.text();
+const NEWSLETTER_TEMPLATE_URL = "https://mailchi.mp/515a9f1d7d9f/andreas-gemsekisterl-woche-18344583?e=869a666e7b";
+const NEWSLETTER_FONT = "'Open Sans', 'Helvetica Neue', Helvetica, Arial, sans-serif";
+
+function escHtml(s) {
+  return String(s).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
-function guessCategory(h4Text) {
-  const t = (h4Text || "").toLowerCase();
-  if (t.includes("früh") || t.includes("spargel") || t.includes("bärlauch") || t.includes("rhabarber")) return "Frühlingsneuheiten";
-  if (t.includes("kartoffel") || t.includes("erdäpfel") || t.includes("wurzel")) return "Kartoffeln & Wurzeln";
-  if (t.includes("obst") || t.includes("frucht") || t.includes("früchte") || t.includes("baum") || t.includes("strauch") || t.includes("beere")) return "Obst & Früchte";
-  if (t.includes("salat") || t.includes("blatt") || t.includes("spinat") || t.includes("fisolen") || t.includes("mangold")) return "Blatt & Salat";
-  if (t.includes("pilz")) return "Pilze";
-  if (t.includes("zwiebel") || t.includes("knoblauch") || t.includes("schalott")) return "Zwiebeln & Knoblauch";
-  if (t.includes("kräuter") || t.includes("kraut") || t.includes("ingwer")) return "Kräuter";
-  if (t.includes("nuss") || t.includes("nüsse") || t.includes("extra") || t.includes("kren")) return "Nüsse & Extras";
-  if (t.includes("öl") || t.includes("essig")) return "Öle & Essige";
-  if (t.includes("saft") || t.includes("honig") || t.includes("nektar")) return "Säfte & Honig";
-  if (t.includes("ei")) return "Eier";
-  return "Gemüse";
-}
+async function generateNewsletterHtml(products) {
+  const apiRes = await fetch(`/api/fetch-newsletter?url=${encodeURIComponent(NEWSLETTER_TEMPLATE_URL)}`);
+  if (!apiRes.ok) throw new Error("Vorlage nicht ladbar");
+  const html = await apiRes.text();
 
-function parseMailchimpHtml(html) {
   const doc = new DOMParser().parseFromString(html, "text/html");
-  const elements = doc.querySelectorAll("h4, li");
-  let currentCategory = "Gemüse";
-  const products = [];
-  const seenNames = new Set();
 
-  for (const el of elements) {
-    if (el.tagName === "H4") {
-      currentCategory = guessCategory(el.textContent);
-      continue;
-    }
-    const strong = el.querySelector("strong");
-    if (!strong) continue;
-    const name = strong.textContent.trim();
-    if (!name || name.length < 3) continue;
-    const text = el.textContent;
-    const priceMatch = text.match(/€\s*([\d]+[,.][\d]+|[\d]+)\s*\/\s*([^\s<,;]+)/);
-    if (!priceMatch) continue;
-    const price = parseFloat(priceMatch[1].replace(",", "."));
-    const unit = priceMatch[2].trim();
-    if (isNaN(price) || price <= 0 || !unit) continue;
-    const key = name.toLowerCase();
-    if (seenNames.has(key)) continue;
-    seenNames.add(key);
-    products.push({ name, price, unit, category: currentCategory, special: false });
-  }
-  return products;
+  // Find product ULs: contain <strong> and a € price
+  const productUls = Array.from(doc.querySelectorAll("ul")).filter(
+    (ul) => ul.textContent.includes("€") && ul.querySelector("strong")
+  );
+  if (productUls.length === 0) throw new Error("Produktbereich in Vorlage nicht gefunden");
+
+  // Build one <li> per product
+  const makeItem = (p) => {
+    const price = p.price.toFixed(2).replace(".", ",");
+    return (
+      `<li style="color: #ffffff;"><p style="line-height: 1.5; mso-line-height-alt: 150%;">` +
+      `<strong><span style="color:#ffffff;"><span style="font-family: ${NEWSLETTER_FONT}">${escHtml(p.name)}</span></span></strong>` +
+      `<span style="color:#ffffff;"><span style="font-size: 14px"><span style="font-family: ${NEWSLETTER_FONT}"> € ${price}/${escHtml(p.unit)}</span></span></span>` +
+      `</p></li>`
+    );
+  };
+
+  // Replace first product UL with all products; remove the rest
+  productUls[0].innerHTML = products.map(makeItem).join("\n");
+  for (let i = 1; i < productUls.length; i++) productUls[i].remove();
+
+  // Replace week label (KW XX) with current label
+  const body = doc.body;
+  body.innerHTML = body.innerHTML.replace(/KW\s*\d+\s*[·•-]?\s*\d{4}/g, WEEK_LABEL);
+
+  return "<!DOCTYPE html>\n" + doc.documentElement.outerHTML;
 }
 
 // ── Root ──────────────────────────────────────────────────────────────────────
@@ -305,6 +340,7 @@ export default function App() {
   const [currentUser, setCurrentUser] = useState(null); // { id, name }
   const [isAdmin, setIsAdmin] = useState(false); // eslint-disable-line no-unused-vars
   const [products, setProducts] = useState([]);
+  const [dbCategories, setDbCategories] = useState([]);
   const [dbReady, setDbReady] = useState(false);
   const [orders, setOrders] = useState([]);
   const [cart, setCart] = useState({});
@@ -318,9 +354,23 @@ export default function App() {
   useEffect(() => {
     (async () => {
       try {
+        // 1. Load/seed categories first (products need category_id)
+        let cats = await dbLoadCategories();
+        if (cats.length === 0) {
+          await dbSeedCategories(
+            Object.keys(categoryIcons).filter((c) => c !== "Alle Produkte").map((name, i) => ({ name, sort_order: i }))
+          );
+          cats = await dbLoadCategories();
+        }
+        setDbCategories(cats);
+        const catMap = Object.fromEntries(cats.map((c) => [c.name, c.id]));
+
+        // 2. Load/seed products
         const data = await dbLoadProducts();
         if (data.length === 0) {
-          await dbSeedProducts(INITIAL_PRODUCTS);
+          await dbSeedProducts(
+            INITIAL_PRODUCTS.map((p) => ({ name: p.name, price: p.price, unit: p.unit, special: p.special, category_id: catMap[p.category] ?? cats[0]?.id }))
+          );
           setProducts(await dbLoadProducts());
         } else {
           setProducts(data);
@@ -391,7 +441,7 @@ export default function App() {
     const file = e.target.files[0]; if (!file) return;
     setLoading(true);
     try {
-      const parsed = await parseXlsx(file);
+      const parsed = await parseXlsx(file, products, dbCategories);
       if (parsed.length === 0) { setUploadMsg("⚠ Keine Produkte gefunden."); setLoading(false); return; }
       await dbReplaceProducts(parsed);
       setProducts(await dbLoadProducts());
@@ -436,6 +486,8 @@ export default function App() {
   if (screen === "admin") return (
     <AdminPanel
       orders={orders} products={products}
+      categories={dbCategories}
+      onCategoriesChange={async () => setDbCategories(await dbLoadCategories())}
       onUploadClick={() => fileRef.current.click()}
       uploadMsg={uploadMsg} onLogout={handleLogout}
       onRefresh={async () => setOrders(await dbLoadAllOrders())}
@@ -828,23 +880,54 @@ function ProductCard({ product, qty, onQty, onSetQty }) {
 
 // ── Admin Panel ───────────────────────────────────────────────────────────────
 
-function AdminPanel({ orders, products, onUploadClick, uploadMsg, onLogout, onRefresh, onReloadProducts, loading, children }) {
+function AdminPanel({ orders, products, categories, onCategoriesChange, onUploadClick, uploadMsg, onLogout, onRefresh, onReloadProducts, loading, children }) {
   const [tab, setTab] = useState("orders");
   const [editingId, setEditingId] = useState(null);
-  const [editFields, setEditFields] = useState({ name: "", price: "", unit: "" });
+  const [editFields, setEditFields] = useState({ name: "", price: "", unit: "", category_id: null });
   const [showNewForm, setShowNewForm] = useState(false);
-  const [newProduct, setNewProduct] = useState({ name: "", price: "", unit: "", category: "Gemüse" });
+  const [newProduct, setNewProduct] = useState({ name: "", price: "", unit: "", category_id: null });
   const [productSearch, setProductSearch] = useState("");
-  const [mailchimpUrl, setMailchimpUrl] = useState("");
-  const [mailchimpMsg, setMailchimpMsg] = useState("");
-  const [mailchimpPreview, setMailchimpPreview] = useState(null);
-  const [mcLoading, setMcLoading] = useState(false);
+  const [exportLoading, setExportLoading] = useState(false);
+  const [exportMsg, setExportMsg] = useState("");
+  const [editingCatId, setEditingCatId] = useState(null);
+  const [editCatName, setEditCatName] = useState("");
+  const [showNewCatForm, setShowNewCatForm] = useState(false);
+  const [newCatName, setNewCatName] = useState("");
+
+  const handleAddCategory = async () => {
+    if (!newCatName.trim()) return;
+    try {
+      await dbAddCategory(newCatName.trim());
+      await onCategoriesChange();
+      setShowNewCatForm(false);
+      setNewCatName("");
+    } catch (e) { console.error(e); }
+  };
+
+  const handleRenameCategory = async (cat) => {
+    if (!editCatName.trim() || editCatName.trim() === cat.name) { setEditingCatId(null); return; }
+    try {
+      await dbRenameCategory(cat.id, editCatName.trim());
+      await onCategoriesChange();
+      setEditingCatId(null);
+    } catch (e) { console.error(e); }
+  };
+
+  const handleDeleteCategory = async (cat) => {
+    const count = products.filter((p) => p.category_id === cat.id).length;
+    if (count > 0) { alert(`Kategorie wird von ${count} Produkt(en) verwendet. Die Produkte werden keiner Kategorie zugeordnet.`); } // eslint-disable-line no-alert
+    try {
+      await dbDeleteCategory(cat.id);
+      await onCategoriesChange();
+      await onReloadProducts();
+    } catch (e) { console.error(e); }
+  };
 
   const handleSaveProduct = async (id) => {
     const price = parseFloat(editFields.price);
     if (!editFields.name.trim() || isNaN(price) || price <= 0) return;
     try {
-      await dbUpdateProduct(id, { name: editFields.name.trim(), price, unit: editFields.unit.trim() });
+      await dbUpdateProduct(id, { name: editFields.name.trim(), price, unit: editFields.unit.trim(), category_id: editFields.category_id });
       await onReloadProducts();
       setEditingId(null);
     } catch (e) { console.error(e); }
@@ -858,45 +941,31 @@ function AdminPanel({ orders, products, onUploadClick, uploadMsg, onLogout, onRe
     } catch (e) { console.error(e); }
   };
 
-  const handleMailchimpLoad = async () => {
-    if (!mailchimpUrl.trim()) return;
-    setMcLoading(true);
-    setMailchimpMsg("Lade Newsletter…");
-    setMailchimpPreview(null);
+  const handleNewsletterExport = async () => {
+    setExportLoading(true);
+    setExportMsg("Generiere Newsletter…");
     try {
-      const html = await fetchMailchimpHtml(mailchimpUrl.trim());
-      const parsed = parseMailchimpHtml(html);
-      if (parsed.length === 0) {
-        setMailchimpMsg("⚠ Keine Produkte gefunden. Bitte URL prüfen.");
-      } else {
-        setMailchimpPreview(parsed);
-        setMailchimpMsg(`✓ ${parsed.length} Produkte erkannt.`);
-      }
-    } catch { setMailchimpMsg("⚠ Fehler beim Laden. Bitte URL prüfen."); }
-    setMcLoading(false);
-  };
-
-  const handleMailchimpImport = async () => {
-    if (!mailchimpPreview) return;
-    setMcLoading(true);
-    try {
-      await dbReplaceProducts(mailchimpPreview);
-      await onReloadProducts();
-      setMailchimpMsg(`✓ ${mailchimpPreview.length} Produkte importiert.`);
-      setMailchimpPreview(null);
-      setMailchimpUrl("");
-    } catch { setMailchimpMsg("⚠ Fehler beim Importieren."); }
-    setMcLoading(false);
+      const html = await generateNewsletterHtml(products);
+      const blob = new Blob([html], { type: "text/html" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `newsletter-${new Date().toISOString().slice(0, 10)}.html`;
+      a.click();
+      URL.revokeObjectURL(url);
+      setExportMsg("✓ Newsletter heruntergeladen.");
+    } catch (e) { setExportMsg("⚠ Fehler: " + e.message); }
+    setExportLoading(false);
   };
 
   const handleAddProduct = async () => {
     const price = parseFloat(newProduct.price);
     if (!newProduct.name.trim() || isNaN(price) || price <= 0) return;
     try {
-      await dbAddProduct({ name: newProduct.name.trim(), price, unit: newProduct.unit.trim(), category: newProduct.category, special: false });
+      await dbAddProduct({ name: newProduct.name.trim(), price, unit: newProduct.unit.trim(), category_id: newProduct.category_id ?? categories[0]?.id ?? null, special: false });
       await onReloadProducts();
       setShowNewForm(false);
-      setNewProduct({ name: "", price: "", unit: "", category: "Gemüse" });
+      setNewProduct({ name: "", price: "", unit: "", category_id: null });
     } catch (e) { console.error(e); }
   };
 
@@ -917,9 +986,9 @@ function AdminPanel({ orders, products, onUploadClick, uploadMsg, onLogout, onRe
 
       <div style={{ maxWidth: 1100, margin: "1.5rem auto", padding: "0 1.5rem" }}>
         <div style={{ display: "flex", gap: 8, marginBottom: "1.5rem" }}>
-          {["orders", "products", "upload", "mailchimp"].map((t) => (
+          {["orders", "products", "kategorien", "upload", "mailchimp"].map((t) => (
             <button key={t} onClick={() => setTab(t)} style={{ background: tab === t ? "#16a34a" : "white", color: tab === t ? "white" : "#4b7c59", border: "1px solid " + (tab === t ? "#16a34a" : "#bbf7d0"), borderRadius: 10, padding: "8px 18px", fontSize: 14, cursor: "pointer", fontWeight: tab === t ? 700 : 400 }}>
-              {t === "orders" ? "📋 Bestellungen" : t === "products" ? "🥦 Produktliste" : t === "upload" ? "📤 Excel-Import" : "📧 Mailchimp"}
+              {t === "orders" ? "📋 Bestellungen" : t === "products" ? "🥦 Produktliste" : t === "kategorien" ? "🏷️ Kategorien" : t === "upload" ? "📤 Excel-Import" : "📧 Mailchimp"}
             </button>
           ))}
         </div>
@@ -1015,11 +1084,11 @@ function AdminPanel({ orders, products, onUploadClick, uploadMsg, onLogout, onRe
                     onChange={(e) => setNewProduct((p) => ({ ...p, unit: e.target.value }))}
                     style={{ ...inputStyle, width: 140, flex: "0 0 140px", padding: "8px 12px", fontSize: 13 }} />
                 </div>
-                <select value={newProduct.category}
-                  onChange={(e) => setNewProduct((p) => ({ ...p, category: e.target.value }))}
+                <select value={newProduct.category_id ?? categories[0]?.id ?? ""}
+                  onChange={(e) => setNewProduct((p) => ({ ...p, category_id: parseInt(e.target.value) }))}
                   style={{ ...inputStyle, marginBottom: 12, padding: "8px 12px", fontSize: 13 }}>
-                  {Object.keys(categoryIcons).filter((c) => c !== "Alle Produkte").map((cat) => (
-                    <option key={cat} value={cat}>{categoryIcons[cat]} {cat}</option>
+                  {categories.map((c) => (
+                    <option key={c.id} value={c.id}>{categoryIcons[c.name] || "🥦"} {c.name}</option>
                   ))}
                 </select>
                 <div style={{ display: "flex", gap: 8 }}>
@@ -1027,7 +1096,7 @@ function AdminPanel({ orders, products, onUploadClick, uploadMsg, onLogout, onRe
                     style={{ background: "#16a34a", color: "white", border: "none", borderRadius: 8, padding: "8px 18px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
                     Hinzufügen
                   </button>
-                  <button onClick={() => { setShowNewForm(false); setNewProduct({ name: "", price: "", unit: "", category: "Gemüse" }); }}
+                  <button onClick={() => { setShowNewForm(false); setNewProduct({ name: "", price: "", unit: "", category_id: null }); }}
                     style={{ background: "white", color: "#4b7c59", border: "1px solid #bbf7d0", borderRadius: 8, padding: "8px 18px", fontSize: 13, cursor: "pointer" }}>
                     Abbrechen
                   </button>
@@ -1047,6 +1116,11 @@ function AdminPanel({ orders, products, onUploadClick, uploadMsg, onLogout, onRe
                   <input value={editFields.unit}
                     onChange={(e) => setEditFields((f) => ({ ...f, unit: e.target.value }))}
                     style={{ ...inputStyle, width: 120, flex: "0 0 120px", padding: "6px 10px", fontSize: 13 }} />
+                  <select value={editFields.category_id ?? ""}
+                    onChange={(e) => setEditFields((f) => ({ ...f, category_id: parseInt(e.target.value) }))}
+                    style={{ ...inputStyle, flex: "1 1 150px", padding: "6px 10px", fontSize: 13 }}>
+                    {categories.map((c) => <option key={c.id} value={c.id}>{categoryIcons[c.name] || "🥦"} {c.name}</option>)}
+                  </select>
                   <div style={{ display: "flex", gap: 6 }}>
                     <button onClick={() => handleSaveProduct(p.id)}
                       style={{ background: "#16a34a", color: "white", border: "none", borderRadius: 8, padding: "6px 14px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
@@ -1065,7 +1139,7 @@ function AdminPanel({ orders, products, onUploadClick, uploadMsg, onLogout, onRe
                     <div style={{ fontSize: 12, color: "#4b7c59" }}>€ {p.price.toFixed(2)} / {p.unit} · <span style={{ color: "#6ee7b7" }}>{p.category}</span></div>
                   </div>
                   <div style={{ display: "flex", gap: 6, flexShrink: 0 }}>
-                    <button onClick={() => { setEditingId(p.id); setEditFields({ name: p.name, price: p.price, unit: p.unit }); setShowNewForm(false); }}
+                    <button onClick={() => { setEditingId(p.id); setEditFields({ name: p.name, price: p.price, unit: p.unit, category_id: p.category_id }); setShowNewForm(false); }}
                       style={{ background: "white", color: "#4b7c59", border: "1px solid #bbf7d0", borderRadius: 8, padding: "5px 12px", fontSize: 12, cursor: "pointer" }}>
                       Bearbeiten
                     </button>
@@ -1080,56 +1154,94 @@ function AdminPanel({ orders, products, onUploadClick, uploadMsg, onLogout, onRe
           </div>
         )}
 
+        {tab === "kategorien" && (
+          <div>
+            <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "1rem" }}>
+              <span style={{ fontWeight: 700, color: "#14532d", fontSize: 15 }}>{categories.length} Kategorien</span>
+              <button onClick={() => { setShowNewCatForm(true); setEditingCatId(null); }} disabled={showNewCatForm}
+                style={{ background: "#16a34a", color: "white", border: "none", borderRadius: 10, padding: "8px 18px", fontSize: 13, fontWeight: 700, cursor: "pointer", opacity: showNewCatForm ? 0.5 : 1 }}>
+                + Neue Kategorie
+              </button>
+            </div>
+
+            {showNewCatForm && (
+              <div style={{ background: "#f0fdf4", borderRadius: 12, padding: "16px", border: "2px solid #86efac", marginBottom: "1rem" }}>
+                <div style={{ fontWeight: 700, color: "#14532d", marginBottom: 12, fontSize: 14 }}>Neue Kategorie</div>
+                <input placeholder="Name *" value={newCatName}
+                  onChange={(e) => setNewCatName(e.target.value)}
+                  style={{ ...inputStyle, marginBottom: 10, padding: "8px 12px", fontSize: 13 }} />
+                <div style={{ display: "flex", gap: 8 }}>
+                  <button onClick={handleAddCategory}
+                    style={{ background: "#16a34a", color: "white", border: "none", borderRadius: 8, padding: "8px 18px", fontSize: 13, fontWeight: 700, cursor: "pointer" }}>
+                    Hinzufügen
+                  </button>
+                  <button onClick={() => { setShowNewCatForm(false); setNewCatName(""); }}
+                    style={{ background: "white", color: "#4b7c59", border: "1px solid #bbf7d0", borderRadius: 8, padding: "8px 18px", fontSize: 13, cursor: "pointer" }}>
+                    Abbrechen
+                  </button>
+                </div>
+              </div>
+            )}
+
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {categories.map((cat) => editingCatId === cat.id ? (
+                <div key={cat.id} style={{ background: "white", borderRadius: 12, padding: "12px 16px", border: "2px solid #86efac", display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{ fontSize: 20 }}>{categoryIcons[editCatName] || "🥦"}</span>
+                  <input value={editCatName}
+                    onChange={(e) => setEditCatName(e.target.value)}
+                    style={{ ...inputStyle, flex: 1, padding: "6px 10px", fontSize: 13 }} />
+                  <button onClick={() => handleRenameCategory(cat)}
+                    style={{ background: "#16a34a", color: "white", border: "none", borderRadius: 8, padding: "6px 14px", fontSize: 12, fontWeight: 700, cursor: "pointer" }}>
+                    Speichern
+                  </button>
+                  <button onClick={() => setEditingCatId(null)}
+                    style={{ background: "white", color: "#4b7c59", border: "1px solid #bbf7d0", borderRadius: 8, padding: "6px 14px", fontSize: 12, cursor: "pointer" }}>
+                    Abbrechen
+                  </button>
+                </div>
+              ) : (
+                <div key={cat.id} style={{ background: "white", borderRadius: 12, padding: "12px 16px", border: "1px solid #e8f5e9", display: "flex", alignItems: "center", gap: 10 }}>
+                  <span style={{ fontSize: 20 }}>{categoryIcons[cat.name] || "🥦"}</span>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontSize: 13, fontWeight: 600, color: "#14532d" }}>{cat.name}</div>
+                    <div style={{ fontSize: 11, color: "#4b7c59" }}>{products.filter((p) => p.category === cat.name).length} Produkte</div>
+                  </div>
+                  <div style={{ display: "flex", gap: 6 }}>
+                    <button onClick={() => { setEditingCatId(cat.id); setEditCatName(cat.name); setShowNewCatForm(false); }}
+                      style={{ background: "white", color: "#4b7c59", border: "1px solid #bbf7d0", borderRadius: 8, padding: "5px 12px", fontSize: 12, cursor: "pointer" }}>
+                      Umbenennen
+                    </button>
+                    <button onClick={() => handleDeleteCategory(cat)}
+                      style={{ background: "white", color: "#dc2626", border: "1px solid #fca5a5", borderRadius: 8, padding: "5px 12px", fontSize: 12, cursor: "pointer" }}>
+                      Löschen
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
+
         {tab === "mailchimp" && (
-          <div style={{ maxWidth: 560 }}>
+          <div style={{ maxWidth: 480 }}>
             <div style={{ background: "white", borderRadius: 16, padding: "2rem", border: "1px solid #e8f5e9" }}>
               <div style={{ fontSize: 40, marginBottom: "1rem" }}>📧</div>
-              <h3 style={{ fontWeight: 700, fontSize: 18, color: "#14532d", marginBottom: 8 }}>Mailchimp-Newsletter importieren</h3>
+              <h3 style={{ fontWeight: 700, fontSize: 18, color: "#14532d", marginBottom: 8 }}>Mailchimp-Newsletter exportieren</h3>
               <p style={{ color: "#4b7c59", fontSize: 14, marginBottom: "1.5rem", lineHeight: 1.6 }}>
-                Newsletter-Link einfügen – Produkte werden automatisch erkannt und können dann in die Datenbank übernommen werden.
+                Generiert eine HTML-Datei auf Basis der bestehenden Newsletter-Vorlage.
+                Die Produktliste wird durch die aktuellen Datenbankprodukte ersetzt.
+                Die Datei kann direkt in Mailchimp hochgeladen werden.
               </p>
-              <input type="url" placeholder="https://mailchi.mp/…" value={mailchimpUrl}
-                onChange={(e) => { setMailchimpUrl(e.target.value); setMailchimpMsg(""); setMailchimpPreview(null); }}
-                style={{ ...inputStyle, marginBottom: 12 }} />
-              <button onClick={handleMailchimpLoad} disabled={mcLoading || !mailchimpUrl.trim()}
-                style={{ ...btnPrimary, width: "100%", opacity: mcLoading || !mailchimpUrl.trim() ? 0.7 : 1 }}>
-                {mcLoading ? "Lade…" : "Vorschau laden"}
+              <button onClick={handleNewsletterExport} disabled={exportLoading}
+                style={{ ...btnPrimary, width: "100%", opacity: exportLoading ? 0.7 : 1 }}>
+                {exportLoading ? "Generiere…" : `Newsletter exportieren (${products.length} Produkte)`}
               </button>
-              {mailchimpMsg && (
-                <div style={{ marginTop: "1rem", padding: "10px 14px", background: mailchimpMsg.startsWith("✓") ? "#f0fdf4" : "#fef9c3", border: "1px solid " + (mailchimpMsg.startsWith("✓") ? "#bbf7d0" : "#fde68a"), borderRadius: 8, fontSize: 13, color: mailchimpMsg.startsWith("✓") ? "#166534" : "#854d0e" }}>
-                  {mailchimpMsg}
+              {exportMsg && (
+                <div style={{ marginTop: "1rem", padding: "10px 14px", background: exportMsg.startsWith("✓") ? "#f0fdf4" : "#fef9c3", border: "1px solid " + (exportMsg.startsWith("✓") ? "#bbf7d0" : "#fde68a"), borderRadius: 8, fontSize: 13, color: exportMsg.startsWith("✓") ? "#166534" : "#854d0e" }}>
+                  {exportMsg}
                 </div>
               )}
             </div>
-
-            {mailchimpPreview && mailchimpPreview.length > 0 && (
-              <div style={{ marginTop: "1.5rem" }}>
-                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.75rem" }}>
-                  <span style={{ fontWeight: 700, color: "#14532d", fontSize: 15 }}>Vorschau</span>
-                  <button onClick={handleMailchimpImport} disabled={mcLoading}
-                    style={{ background: "#16a34a", color: "white", border: "none", borderRadius: 10, padding: "8px 18px", fontSize: 13, fontWeight: 700, cursor: "pointer", opacity: mcLoading ? 0.7 : 1 }}>
-                    {mcLoading ? "Importieren…" : `${mailchimpPreview.length} Produkte übernehmen`}
-                  </button>
-                </div>
-                <div style={{ background: "white", borderRadius: 12, border: "1px solid #e8f5e9", overflow: "hidden" }}>
-                  {mailchimpPreview.slice(0, 15).map((p, i) => (
-                    <div key={i} style={{ padding: "10px 16px", borderBottom: i < Math.min(mailchimpPreview.length, 15) - 1 ? "1px solid #f0fdf4" : "none", display: "flex", alignItems: "baseline", gap: 8 }}>
-                      <span style={{ fontWeight: 600, color: "#14532d", fontSize: 13, flex: 1 }}>{p.name}</span>
-                      <span style={{ color: "#4b7c59", fontSize: 12, whiteSpace: "nowrap" }}>€ {p.price.toFixed(2)} / {p.unit}</span>
-                      <span style={{ color: "#6ee7b7", fontSize: 11, whiteSpace: "nowrap" }}>{p.category}</span>
-                    </div>
-                  ))}
-                  {mailchimpPreview.length > 15 && (
-                    <div style={{ padding: "10px 16px", color: "#4b7c59", fontSize: 12, fontStyle: "italic" }}>
-                      … und {mailchimpPreview.length - 15} weitere Produkte
-                    </div>
-                  )}
-                </div>
-                <p style={{ fontSize: 12, color: "#9ca3af", marginTop: 8 }}>
-                  ⚠ Bestehende Produkte werden beim Übernehmen ersetzt.
-                </p>
-              </div>
-            )}
           </div>
         )}
 
