@@ -242,6 +242,62 @@ function parseXlsx(file) {
   });
 }
 
+async function fetchMailchimpHtml(url) {
+  // In production (Vercel): use own serverless function – no CORS issues, no IP blocks
+  const apiRes = await fetch(`/api/fetch-newsletter?url=${encodeURIComponent(url)}`);
+  if (apiRes.ok) return apiRes.text();
+  // Fallback for local dev (CRA dev server doesn't serve /api/)
+  const proxyRes = await fetch(`https://corsproxy.io/?${encodeURIComponent(url)}`);
+  if (!proxyRes.ok) throw new Error(`Status ${proxyRes.status}`);
+  return proxyRes.text();
+}
+
+function guessCategory(h4Text) {
+  const t = (h4Text || "").toLowerCase();
+  if (t.includes("früh") || t.includes("spargel") || t.includes("bärlauch") || t.includes("rhabarber")) return "Frühlingsneuheiten";
+  if (t.includes("kartoffel") || t.includes("erdäpfel") || t.includes("wurzel")) return "Kartoffeln & Wurzeln";
+  if (t.includes("obst") || t.includes("frucht") || t.includes("früchte") || t.includes("baum") || t.includes("strauch") || t.includes("beere")) return "Obst & Früchte";
+  if (t.includes("salat") || t.includes("blatt") || t.includes("spinat") || t.includes("fisolen") || t.includes("mangold")) return "Blatt & Salat";
+  if (t.includes("pilz")) return "Pilze";
+  if (t.includes("zwiebel") || t.includes("knoblauch") || t.includes("schalott")) return "Zwiebeln & Knoblauch";
+  if (t.includes("kräuter") || t.includes("kraut") || t.includes("ingwer")) return "Kräuter";
+  if (t.includes("nuss") || t.includes("nüsse") || t.includes("extra") || t.includes("kren")) return "Nüsse & Extras";
+  if (t.includes("öl") || t.includes("essig")) return "Öle & Essige";
+  if (t.includes("saft") || t.includes("honig") || t.includes("nektar")) return "Säfte & Honig";
+  if (t.includes("ei")) return "Eier";
+  return "Gemüse";
+}
+
+function parseMailchimpHtml(html) {
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const elements = doc.querySelectorAll("h4, li");
+  let currentCategory = "Gemüse";
+  const products = [];
+  const seenNames = new Set();
+
+  for (const el of elements) {
+    if (el.tagName === "H4") {
+      currentCategory = guessCategory(el.textContent);
+      continue;
+    }
+    const strong = el.querySelector("strong");
+    if (!strong) continue;
+    const name = strong.textContent.trim();
+    if (!name || name.length < 3) continue;
+    const text = el.textContent;
+    const priceMatch = text.match(/€\s*([\d]+[,.][\d]+|[\d]+)\s*\/\s*([^\s<,;]+)/);
+    if (!priceMatch) continue;
+    const price = parseFloat(priceMatch[1].replace(",", "."));
+    const unit = priceMatch[2].trim();
+    if (isNaN(price) || price <= 0 || !unit) continue;
+    const key = name.toLowerCase();
+    if (seenNames.has(key)) continue;
+    seenNames.add(key);
+    products.push({ name, price, unit, category: currentCategory, special: false });
+  }
+  return products;
+}
+
 // ── Root ──────────────────────────────────────────────────────────────────────
 
 export default function App() {
@@ -779,6 +835,10 @@ function AdminPanel({ orders, products, onUploadClick, uploadMsg, onLogout, onRe
   const [showNewForm, setShowNewForm] = useState(false);
   const [newProduct, setNewProduct] = useState({ name: "", price: "", unit: "", category: "Gemüse" });
   const [productSearch, setProductSearch] = useState("");
+  const [mailchimpUrl, setMailchimpUrl] = useState("");
+  const [mailchimpMsg, setMailchimpMsg] = useState("");
+  const [mailchimpPreview, setMailchimpPreview] = useState(null);
+  const [mcLoading, setMcLoading] = useState(false);
 
   const handleSaveProduct = async (id) => {
     const price = parseFloat(editFields.price);
@@ -796,6 +856,37 @@ function AdminPanel({ orders, products, onUploadClick, uploadMsg, onLogout, onRe
       await dbDeleteProduct(id);
       await onReloadProducts();
     } catch (e) { console.error(e); }
+  };
+
+  const handleMailchimpLoad = async () => {
+    if (!mailchimpUrl.trim()) return;
+    setMcLoading(true);
+    setMailchimpMsg("Lade Newsletter…");
+    setMailchimpPreview(null);
+    try {
+      const html = await fetchMailchimpHtml(mailchimpUrl.trim());
+      const parsed = parseMailchimpHtml(html);
+      if (parsed.length === 0) {
+        setMailchimpMsg("⚠ Keine Produkte gefunden. Bitte URL prüfen.");
+      } else {
+        setMailchimpPreview(parsed);
+        setMailchimpMsg(`✓ ${parsed.length} Produkte erkannt.`);
+      }
+    } catch { setMailchimpMsg("⚠ Fehler beim Laden. Bitte URL prüfen."); }
+    setMcLoading(false);
+  };
+
+  const handleMailchimpImport = async () => {
+    if (!mailchimpPreview) return;
+    setMcLoading(true);
+    try {
+      await dbReplaceProducts(mailchimpPreview);
+      await onReloadProducts();
+      setMailchimpMsg(`✓ ${mailchimpPreview.length} Produkte importiert.`);
+      setMailchimpPreview(null);
+      setMailchimpUrl("");
+    } catch { setMailchimpMsg("⚠ Fehler beim Importieren."); }
+    setMcLoading(false);
   };
 
   const handleAddProduct = async () => {
@@ -826,9 +917,9 @@ function AdminPanel({ orders, products, onUploadClick, uploadMsg, onLogout, onRe
 
       <div style={{ maxWidth: 1100, margin: "1.5rem auto", padding: "0 1.5rem" }}>
         <div style={{ display: "flex", gap: 8, marginBottom: "1.5rem" }}>
-          {["orders", "products", "upload"].map((t) => (
+          {["orders", "products", "upload", "mailchimp"].map((t) => (
             <button key={t} onClick={() => setTab(t)} style={{ background: tab === t ? "#16a34a" : "white", color: tab === t ? "white" : "#4b7c59", border: "1px solid " + (tab === t ? "#16a34a" : "#bbf7d0"), borderRadius: 10, padding: "8px 18px", fontSize: 14, cursor: "pointer", fontWeight: tab === t ? 700 : 400 }}>
-              {t === "orders" ? "📋 Bestellungen" : t === "products" ? "🥦 Produktliste" : "📤 Excel-Import"}
+              {t === "orders" ? "📋 Bestellungen" : t === "products" ? "🥦 Produktliste" : t === "upload" ? "📤 Excel-Import" : "📧 Mailchimp"}
             </button>
           ))}
         </div>
@@ -986,6 +1077,59 @@ function AdminPanel({ orders, products, onUploadClick, uploadMsg, onLogout, onRe
                 </div>
               ))}
             </div>
+          </div>
+        )}
+
+        {tab === "mailchimp" && (
+          <div style={{ maxWidth: 560 }}>
+            <div style={{ background: "white", borderRadius: 16, padding: "2rem", border: "1px solid #e8f5e9" }}>
+              <div style={{ fontSize: 40, marginBottom: "1rem" }}>📧</div>
+              <h3 style={{ fontWeight: 700, fontSize: 18, color: "#14532d", marginBottom: 8 }}>Mailchimp-Newsletter importieren</h3>
+              <p style={{ color: "#4b7c59", fontSize: 14, marginBottom: "1.5rem", lineHeight: 1.6 }}>
+                Newsletter-Link einfügen – Produkte werden automatisch erkannt und können dann in die Datenbank übernommen werden.
+              </p>
+              <input type="url" placeholder="https://mailchi.mp/…" value={mailchimpUrl}
+                onChange={(e) => { setMailchimpUrl(e.target.value); setMailchimpMsg(""); setMailchimpPreview(null); }}
+                style={{ ...inputStyle, marginBottom: 12 }} />
+              <button onClick={handleMailchimpLoad} disabled={mcLoading || !mailchimpUrl.trim()}
+                style={{ ...btnPrimary, width: "100%", opacity: mcLoading || !mailchimpUrl.trim() ? 0.7 : 1 }}>
+                {mcLoading ? "Lade…" : "Vorschau laden"}
+              </button>
+              {mailchimpMsg && (
+                <div style={{ marginTop: "1rem", padding: "10px 14px", background: mailchimpMsg.startsWith("✓") ? "#f0fdf4" : "#fef9c3", border: "1px solid " + (mailchimpMsg.startsWith("✓") ? "#bbf7d0" : "#fde68a"), borderRadius: 8, fontSize: 13, color: mailchimpMsg.startsWith("✓") ? "#166534" : "#854d0e" }}>
+                  {mailchimpMsg}
+                </div>
+              )}
+            </div>
+
+            {mailchimpPreview && mailchimpPreview.length > 0 && (
+              <div style={{ marginTop: "1.5rem" }}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: "0.75rem" }}>
+                  <span style={{ fontWeight: 700, color: "#14532d", fontSize: 15 }}>Vorschau</span>
+                  <button onClick={handleMailchimpImport} disabled={mcLoading}
+                    style={{ background: "#16a34a", color: "white", border: "none", borderRadius: 10, padding: "8px 18px", fontSize: 13, fontWeight: 700, cursor: "pointer", opacity: mcLoading ? 0.7 : 1 }}>
+                    {mcLoading ? "Importieren…" : `${mailchimpPreview.length} Produkte übernehmen`}
+                  </button>
+                </div>
+                <div style={{ background: "white", borderRadius: 12, border: "1px solid #e8f5e9", overflow: "hidden" }}>
+                  {mailchimpPreview.slice(0, 15).map((p, i) => (
+                    <div key={i} style={{ padding: "10px 16px", borderBottom: i < Math.min(mailchimpPreview.length, 15) - 1 ? "1px solid #f0fdf4" : "none", display: "flex", alignItems: "baseline", gap: 8 }}>
+                      <span style={{ fontWeight: 600, color: "#14532d", fontSize: 13, flex: 1 }}>{p.name}</span>
+                      <span style={{ color: "#4b7c59", fontSize: 12, whiteSpace: "nowrap" }}>€ {p.price.toFixed(2)} / {p.unit}</span>
+                      <span style={{ color: "#6ee7b7", fontSize: 11, whiteSpace: "nowrap" }}>{p.category}</span>
+                    </div>
+                  ))}
+                  {mailchimpPreview.length > 15 && (
+                    <div style={{ padding: "10px 16px", color: "#4b7c59", fontSize: 12, fontStyle: "italic" }}>
+                      … und {mailchimpPreview.length - 15} weitere Produkte
+                    </div>
+                  )}
+                </div>
+                <p style={{ fontSize: 12, color: "#9ca3af", marginTop: 8 }}>
+                  ⚠ Bestehende Produkte werden beim Übernehmen ersetzt.
+                </p>
+              </div>
+            )}
           </div>
         )}
 
